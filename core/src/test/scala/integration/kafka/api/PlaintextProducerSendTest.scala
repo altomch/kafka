@@ -19,16 +19,17 @@ package kafka.api
 
 import java.util.Properties
 import java.util.concurrent.{ExecutionException, Future, TimeUnit}
-
 import kafka.log.LogConfig
 import kafka.server.Defaults
 import kafka.utils.TestUtils
-import org.apache.kafka.clients.producer.{BufferExhaustedException, KafkaProducer, ProducerConfig, ProducerRecord, RecordMetadata}
+import org.apache.kafka.clients.producer.{BufferExhaustedException, Callback, KafkaProducer, ProducerConfig, ProducerRecord, RecordMetadata}
 import org.apache.kafka.common.errors.{InvalidTimestampException, RecordTooLargeException, SerializationException, TimeoutException}
 import org.apache.kafka.common.record.{DefaultRecord, DefaultRecordBatch, Records, TimestampType}
 import org.apache.kafka.common.serialization.ByteArraySerializer
 import org.junit.jupiter.api.Assertions._
 import org.junit.jupiter.api.Test
+
+import java.util.concurrent.atomic.AtomicReference
 
 
 class PlaintextProducerSendTest extends BaseProducerSendTest {
@@ -171,6 +172,41 @@ class PlaintextProducerSendTest extends BaseProducerSendTest {
     val future2 = sendUntilQueued(producer2) // wait until metadata is available and one record is queued
     verifyBufferExhausted(send(producer2))       // should fail send since buffer is full
     verifySendSuccess(future2)               // previous batch should be completed and sent now
+  }
+
+  // Test that producer send to another topic from callback.
+  @Test
+  def testSequentialSendToDifferentTopicsNonBlockingProducer(): Unit = {
+
+    def send(producer: KafkaProducer[Array[Byte],Array[Byte]], topic: String, callback: Callback = (_, _) => ()): Future[RecordMetadata] = {
+      producer.send(new ProducerRecord(topic, 0, "key".getBytes, new Array[Byte](1000)), callback)
+    }
+
+    def verifySendSuccess(topic: String, future: Future[RecordMetadata]): Unit = {
+      val recordMetadata = future.get(30, TimeUnit.SECONDS)
+      assertEquals(topic, recordMetadata.topic)
+      assertEquals(0, recordMetadata.partition)
+      assertTrue(recordMetadata.offset >= 0, s"Invalid offset $recordMetadata")
+    }
+
+    val topic2 = "topic-2"
+    TestUtils.createTopic(zkClient, topic2, 1, 1, servers)
+
+    val producer = createProducer(brokerList = brokerList)
+
+    val future2Ref = new AtomicReference[Future[RecordMetadata]]()
+
+    val future1 = send(producer, topic, (_, _) => {
+      logger.warn("Message has been sent to topic.")
+      future2Ref.set(send(producer, topic2))
+    })
+
+    val future2 = TestUtils.awaitValue(() => Option(future2Ref.get()), "Message wasn't sent to 2nd topic.")
+
+    verifySendSuccess(topic, future1)
+    verifySendSuccess(topic2, future2)
+
+    producer.close()
   }
 
   @Test
